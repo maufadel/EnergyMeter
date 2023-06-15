@@ -12,22 +12,22 @@
  */
 BEGIN
 {
-	printf("Timestamp; Operation; Byte Size; Command; PID\n");
+	printf("Timestamp;Operation;ByteSize;Command;PID\n");
 }
 tracepoint:syscalls:sys_enter_write 
 {
 	if (comm != "bpftrace")
 	{
-		time("%Y-%m-%d %H:%M:%S; ");
-		printf("WRITE; %d; %s; %d;\n", args->count, comm, pid);
+		time("%Y-%m-%d %H:%M:%S;");
+		printf("WRITE;%d;%s;%d;\n", args->count, comm, pid);
 	} 
 }
 tracepoint:syscalls:sys_enter_read
 {
 	if (comm != "bpftrace") 
         {
-		time("%Y-%m-%d %H:%M:%S; ");
-		printf("READ; %d; %s; %d;\n", args->count, comm, pid);
+		time("%Y-%m-%d %H:%M:%S;");
+		printf("READ;%d;%s;%d;\n", args->count, comm, pid);
 	}
 }
 END

@@ -4,7 +4,10 @@
 get_timestamp() {
     date +"%Y-%m-%d %H:%M:%S"
 }
-output_file="gpu_stats_$(get_timestamp).csv"
+if [ -z ${1+x} ]; 
+then output_file="gpu_stats_$(get_timestamp).csv"; 
+else output_file="$1"; 
+fi
 
 # Create a CSV file and write header
 echo "timestamp,power_usage(W),gpu_fan,temperature,memory_usage(MB)" > "$output_file"
@@ -25,5 +28,5 @@ while true; do
     echo "$timestamp,$power_usage,$gpu_fan,$temperature,$memory_usage" >> "$output_file"
 
     # Wait for 5 seconds before the next data collection
-    sleep 5
+    sleep 0.5
 done
