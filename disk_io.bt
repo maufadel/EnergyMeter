@@ -16,18 +16,18 @@ BEGIN
 }
 tracepoint:syscalls:sys_enter_write 
 {
-	if (comm == "bpftrace")
+	if (comm != "bpftrace")
 	{
 		time("%Y-%m-%d %H:%M:%S; ");
-		printf("%d; WRITE, %s; %d;\n", args->count, comm, pid);
+		printf("WRITE; %d; %s; %d;\n", args->count, comm, pid);
 	} 
 }
 tracepoint:syscalls:sys_enter_read
 {
-	if (comm == "bpftrace") 
+	if (comm != "bpftrace") 
         {
 		time("%Y-%m-%d %H:%M:%S; ");
-		printf("%d; READ, %s; %d;\n", args->count, comm, pid);
+		printf("READ; %d; %s; %d;\n", args->count, comm, pid);
 	}
 }
 END
