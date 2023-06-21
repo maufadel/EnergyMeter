@@ -174,8 +174,10 @@ class EnergyMeter:
         data["total"] = np.sum(data.get("cpu")) + np.sum(data.get("dram")) + data.get("disk") + data.get("gpu")
         keys = data.keys()
         values = [float(val) for val in data.values()]
-        
-        plt.bar(keys, values)
+
+        fig, ax = plt.subplots()
+        bars = ax.bar(list(keys), values)
+        ax.bar_label(bars)
         plt.xlabel('Components')
         plt.ylabel('Jules')
         plt.title(self.meter.label)
