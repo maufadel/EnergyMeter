@@ -44,7 +44,7 @@ class ThreadGpuSampling(threading.Thread):
             nvml_output = self.nvsmi.DeviceQuery("power.draw")
             curr_power_draw = nvml_output.get("gpu")[0].get("power_readings").get("power_draw")
             self.power_draw_history.append(curr_power_draw)
-            time.sleep(SECONDS_BETWEEN_SAMPLES)
+            time.sleep(ThreadGpuSampling.SECONDS_BETWEEN_SAMPLES)
 
 
 class EnergyMeter:
@@ -62,18 +62,16 @@ class EnergyMeter:
         processors. You can find more info here:
         https://dl.acm.org/doi/pdf/10.1145/2989081.2989088.
 
-    - GPU: we measure the energy consumption of the GPU with nvidia-smi. Note that
-        for now, you should run the bash script start_meters.sh on your own BEFORE
-        starting a meter. This bash script will create a folder with a csv file that
-        contains the power consumption that will then be used to measure the energy
-        consumption of the GPU while the function or code chunk was running.
+    - GPU: we measure the energy consumption of the GPU with pynvml. For this, we
+        run a separate thread that samples the power draw of the GPU while the meter
+        is running. We then calculate the mean of this and multiply it by the 
+        duration of the meter.
 
     - Disk: we cannot directly measure the energy consumption of the disk in the same
         way that we do for the other components, so we have implemented an bpftrace
-        probe that tracks all the bytes read and written to disk. This probe will
-        be launched by the bash script start_meters.sh and will create another csv
-        file that is saved along the csv for the GPU stats. We then calculated the
-        energy consumption with the following formulae:
+        probe that tracks all the bytes read and written to disk. This probe is run 
+        as a separate thread inside EnergyMeter. We then calculate the energy 
+        consumption with the following formulae:
         disk_active_time = (bytes_read + bytes_written) / DISK_SPEED
         disk_idle_time = total_meter_time - disk_active_time
         total_energy = disk_active_time * DISK_ACTIVE_POWER +
@@ -161,7 +159,6 @@ class EnergyMeter:
 
         # Stop tracking GPU power usage.
         self.__gpu_power_draw_history = self.thread_gpu.power_draw_history
-        print(self.__gpu_power_draw_history)
         self.thread_gpu.stop = True
 
         # Process bpftrace output.
