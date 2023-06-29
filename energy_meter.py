@@ -171,12 +171,19 @@ class EnergyMeter:
         :param bpftrace_output: the output of the bpftrace script.
         :returns: total_rbytes (float), total_wbytes (float).
         """
-        po = bpftrace_output.decode().split("\n")
-        rbytes = json.loads(po[3]).get("data").get("@rbytes")
-        wbytes = json.loads(po[4]).get("data").get("@wbytes")
-        # Do we want to measure other programs disk IO too?
-        total_rbytes = rbytes.get("python", 0) + rbytes.get("python3", 0)
-        total_wbytes = wbytes.get("python", 0) + wbytes.get("python3", 0)
+        bpftrace_output = bpftrace_output.decode()
+        if len(bpftrace_output.strip()) > 0:
+            po = bpftrace_output.split("\n")
+            rbytes = json.loads(po[3]).get("data").get("@rbytes")
+            wbytes = json.loads(po[4]).get("data").get("@wbytes")
+            # Do we want to measure other programs disk IO too?
+            total_rbytes = rbytes.get("python", 0) + rbytes.get("python3", 0)
+            total_wbytes = wbytes.get("python", 0) + wbytes.get("python3", 0)
+        else:
+            # bpftrace produced no output, which means there was no IO activity in the
+            # disk. This only happens when the code run has a very short duration.
+            total_rbytes = 0
+            total_wbytes = 0
 
         return total_rbytes, total_wbytes
 
