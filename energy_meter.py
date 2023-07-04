@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyRAPL
+from pynvml.smi import nvidia_smi
 
 import subprocess
 import os
@@ -16,11 +17,52 @@ import shlex
 import json
 import pandas as pd
 import time
-from pynvml.smi import nvidia_smi
 import threading
 
 
-class ThreadGpuSampling(threading.Thread):
+class ThreadGpuSamplingCmd(threading.Thread):
+    """Thread to sample the power draw of the GPU. It uses nvidia-smi via subprocess check_output 
+    to get the immediate power draw of the GPU in Watts every SECONDS_BETWEEN_SAMPLES seconds 
+    until self.stop is set to True. The samples are stored in the array self.power_draw_history.
+    Note that this process takes much longer than using pynvml (1ms vs. 76ms) but obtains also 
+    info about the processes running on the GPU while pynvml doesn't.
+    """
+    
+    SECONDS_BETWEEN_SAMPLES = 0.5
+    
+    def __init__(self, name):
+        """Init the thread variables and the nvsmi instance to be queried later on.
+        """
+        threading.Thread.__init__(self)
+        self.name = name
+        self.stop = False
+        self.power_draw_history = []
+        self.activity_history = []
+
+    def run(self):
+        """Start the sampling and stop when self.stop == True.
+        """
+        # We stop when self.stop is set to True.
+        while self.stop == False:
+            # Get power draw.
+            pd = subprocess.check_output(shlex.split("nvidia-smi --query-gpu=power.draw --format=csv")).decode().split()
+            self.power_draw_history.append(float(pd[2]))
+            
+            # Get utilization of python/python3 at each time step.
+            o = subprocess.check_output(shlex.split("nvidia-smi pmon -c 1")).decode().split()
+            processes_util = {o[i]: o[i-4] for i in range(25, len(o), 8)}
+            activity = 0
+            if processes_util.get("python") and processes_util.get("python") != "-":
+                activity += float(processes_util.get("python"))
+            if processes_util.get("python3") and processes_util.get("python3") != "-":
+                activity += float(processes_util.get("python3"))
+            self.activity_history.append(activity)
+
+            # Sleep until next cycle.
+            time.sleep(ThreadGpuSampling.SECONDS_BETWEEN_SAMPLES)
+
+
+class ThreadGpuSamplingPyNvml(threading.Thread):
     """Thread to sample the power draw of the GPU. It uses pynvml to get the immediate power
     draw of the GPU in Watts every SECONDS_BETWEEN_SAMPLES seconds until self.stop is set to
     True. The samples are stored in the array self.power_draw_history.
@@ -35,16 +77,18 @@ class ThreadGpuSampling(threading.Thread):
         self.name = name
         self.stop = False
         self.power_draw_history = []
+        self.activity_history = []
         self.nvsmi = nvidia_smi.getInstance()
 
     def run(self):
         """Start the sampling and stop when self.stop == True.
         """
         while self.stop == False:
-            nvml_output = self.nvsmi.DeviceQuery("power.draw")
-            curr_power_draw = nvml_output.get("gpu")[0].get("power_readings").get("power_draw")
-            self.power_draw_history.append(curr_power_draw)
-            time.sleep(ThreadGpuSampling.SECONDS_BETWEEN_SAMPLES)
+            nvml_output = self.nvsmi.DeviceQuery("power.draw,utilization.gpu").get("gpu")[0]
+            # Get power draw.
+            self.power_draw_history.append(nvml_output.get("power_readings").get("power_draw"))
+            # Get utilization at each time step.
+            self.activity_history.append(nvml_output.get("utilization").get("gpu_util"))
 
 
 class EnergyMeter:
@@ -62,7 +106,7 @@ class EnergyMeter:
         processors. You can find more info here:
         https://dl.acm.org/doi/pdf/10.1145/2989081.2989088.
 
-    - GPU: we measure the energy consumption of the GPU with pynvml. For this, we
+    - GPU: we measure the energy consumption of the GPU with nvidia-smi. For this, we
         run a separate thread that samples the power draw of the GPU while the meter
         is running. We then calculate the mean of this and multiply it by the 
         duration of the meter.
@@ -87,7 +131,8 @@ class EnergyMeter:
     )
     ###################################################################################
 
-    def __init__(self, disk_avg_speed, disk_active_power, disk_idle_power, label=None):
+    def __init__(self, disk_avg_speed, disk_active_power, disk_idle_power, 
+                 label=None, include_idle=False):
         """Initiates the variables required to meter the energy consumption of all
         components and sets up the pyRAPL library.
         :param disk_avg_speed: the average read and write speed of the hard disk where
@@ -99,11 +144,15 @@ class EnergyMeter:
         :param disk_idle_power: the average power used by the disk when idle. Just as for
             disk_active_power, this is usually included in the disk specs.
         :param label: this is just an optional string to identify the meter.
+        :include_idle: if energy used during idle times should be included for disk and 
+            GPU.
         """
         if label:
             self.label = label
         else:
             self.label = "Meter"
+
+        self.include_idle = include_idle
 
         # Setup pyRAPL to measure CPU and DRAM.
         pyRAPL.setup()
@@ -114,8 +163,7 @@ class EnergyMeter:
         self.disk_idle_power = disk_idle_power
 
         # Create thread for sampling the power draw of the GPU, this sets up pynvm.
-        self.thread_gpu = ThreadGpuSampling("GPU Sampling Thread")
-        self.__gpu_power_draw_history = []
+        self.thread_gpu = ThreadGpuSamplingPyNvml("GPU Sampling Thread")
 
         # Create the pyRAPL meter to measure CPU and DRAM energy consumption.
         self.meter = pyRAPL.Measurement(self.label)
@@ -143,7 +191,6 @@ class EnergyMeter:
 
         # Thread for GPU.
         self.thread_gpu.start()
-        self.__gpu_power_draw_history = []
 
     def end(self):
         """Finish the measurements and calculate results for CPU and DRAM. This sets the
@@ -158,7 +205,6 @@ class EnergyMeter:
         subprocess.check_output(shlex.split("sudo kill {}".format(self.bpftrace_pid)))
 
         # Stop tracking GPU power usage.
-        self.__gpu_power_draw_history = self.thread_gpu.power_draw_history
         self.thread_gpu.stop = True
 
         # Process bpftrace output.
@@ -204,11 +250,10 @@ class EnergyMeter:
         # disk_idle_time (in seconds) = total_meter_time - disk_active_time
         disk_idle_time = self.meter.result.duration * 1e-6 - disk_active_time
 
-        # total_energy = disk_active_time * DISK_ACTIVE_POWER + disk_idle_time * DISK_IDLE_POWER
-        te = (
-            disk_active_time * self.disk_active_power
-            + disk_idle_time * self.disk_idle_power
-        )
+        # total_energy = disk_active_time * DISK_ACTIVE_POWER (+ disk_idle_time * DISK_IDLE_POWER)
+        te = disk_active_time * self.disk_active_power
+        if self.include_idle:
+            te += disk_idle_time * self.disk_idle_power
         return te
 
     def get_total_jules_cpu(self):
@@ -234,12 +279,33 @@ class EnergyMeter:
             generated by gpu_stats.sh.)
         :returns: the total jules used by the GPU between meter.begin() and meter.end().
         """
-        if len(self.__gpu_power_draw_history) > 0:
-            mean_p = np.mean(self.__gpu_power_draw_history)
+        if len(self.thread_gpu.activity_history) == 0:
+            return 0
+
+        # total_energy = mean_GPU_power_draw * min(meter_duration_ns * 1e-6, GPU_active_time_s)
+        if self.include_idle:
+            # We use the mean power draw thoughout the whole time (including idle time.)
+            mean_p = np.mean(self.thread_gpu.power_draw_history)
+            te = mean_p * self.meter.result.duration * 1e-6
         else:
-            mean_p = 0
-        # total_energy = mean_GPU_power_draw * duration_in_ns * 1e-6
-        return mean_p * self.meter.result.duration * 1e-6
+            # First, check if there was any activity, otherwise return 0.
+            if sum(self.thread_gpu.activity_history) == 0:
+                return 0
+                
+            # We calculate the mean power draw during intervals of time at which
+            # python or python3 was active on the GPU.
+            pdh = self.thread_gpu.power_draw_history
+            ah = self.thread_gpu.activity_history
+            assert len(pdh) == len(ah), "Power draw and activity history have diff lengths!"
+
+            sbs = self.thread_gpu.SECONDS_BETWEEN_SAMPLES
+            mean_p = np.mean([pdh[i] for i in range(len(pdh)) if ah[i] > 0])
+            # We estimate the task was running for length of samples * the time between samples,
+            # or the duration of the meter if this was shorter. Our error in this estimation is
+            # bounded to (t - 2*SECONDS_BETWEEN_SAMPLES, t + SECONDS_BETWEEN_SAMPLES).
+            te = mean_p * min(self.meter.result.duration * 1e-6, len(ah)*sbs)
+            
+        return te
 
     def get_total_jules_per_component(self):
         """This returns the total energy consumption in jules between meter.begin() and
