@@ -30,8 +30,17 @@ You can benchmark your storage speed with the Flexible I/O tester (FIO) as recom
 Storage specs usually include data regarding the power consumption during active (reading or writing) and for idle periods.
 
 ## Troubleshooting
+### pyRAPL/RAPL
 pyRAPL requires access to /sys/class/powercap/intel-rapl, for which sudo access is required. If the access is denied, run the following command on the terminal to enable access to the rapl measurement:
-`sudo chmod -R a+r /sys/class/powercap/intel-rapl`.
+
+`sudo chmod -R a+r /sys/class/powercap/intel-rapl`
+
+### bpftrace
+Also note that you need to have bpftrace installed. On ubuntu, you can install with the following command: 
+
+`sudo apt-get install -y bpftrace`
+
+For other operating systems, please check https://github.com/bpftrace/bpftrace/blob/master/INSTALL.md.
 
 ## Limitations
 EnergyMeter requires to be run on bare metal instances running Linux on Intel and NVIDIA hardware. These requirements are inherited from the tools used for tracking the energy consumption: RAPL (Intel), NVIDIA-SMI (NVIDIA), and eBPF (Linux). Keep in mind that the energy consumption metrics provided are estimations and vary according to different factors including hardware configuration and software versions. Additionally, the energy consumed by cooling, screens and other components not mentioned here are not included in our measurements, so the total energy consumed will likely be different to the total sum of the consumption of CPU, memory, GPU, and storage.
