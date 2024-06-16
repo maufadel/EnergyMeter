@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Fadel Argerich"
+  given-names: "Mauricio"
+  orcid: "https://orcid.org/0009-0008-9348-8426"
+title: "EnergyMeter"
+version: 1.0.0
+date-released: 2023-07-04
+url: "https://github.com/maufadel/EnergyMeter"
