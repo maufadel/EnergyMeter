@@ -47,3 +47,13 @@ EnergyMeter requires to be run on bare metal instances running Linux on Intel an
 
 ## Authorship and License
 I am developing EnergyMeter as a part of my PhD program at Universidad Politécnica de Madrid. EnergyMeter is open sourced under an MIT License. 
+If you found this repository useful, please cite it as:
+```
+@article{argerich2024measuring,
+  title={Measuring and Improving the Energy Efficiency of Large Language Models Inference},
+  author={Fadel Argerich, Mauricio and Pati{\~n}o-Mart{\'\i}nez, Marta},
+  journal={IEEE Access},
+  year={2024},
+  publisher={IEEE}
+}
+```
