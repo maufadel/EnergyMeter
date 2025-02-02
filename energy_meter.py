@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyRAPL
-from pynvml.smi import nvidia_smi
+from pynvml_utils import nvidia_smi
 
 import subprocess
 import os
