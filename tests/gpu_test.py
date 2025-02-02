@@ -72,4 +72,4 @@ for _ in range(200):
     p_img = preprocess_data(img).to("cuda:0")
     probs, labels = predict(model, p_img)
 meter_gpu.end()
-print(meter_gpu.get_total_jules_per_component())
+print(meter_gpu.get_total_joules_per_component())

@@ -9,4 +9,4 @@ meter = EnergyMeter(disk_avg_speed=1600*1e6,
 meter.begin()
 (np.random.rand(300,300)**5)*1/np.random.rand(300,300)
 meter.end()
-print(meter.get_total_jules_per_component())
+print(meter.get_total_joules_per_component())
