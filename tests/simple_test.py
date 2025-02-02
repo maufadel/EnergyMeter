@@ -1,7 +1,4 @@
-import sys
-sys.path.insert(1, '../')
-
-from energy_meter import EnergyMeter
+from energymeter import EnergyMeter
 import time
 import numpy as np
 

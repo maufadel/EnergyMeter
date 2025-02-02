@@ -1,7 +1,4 @@
-import sys
-sys.path.insert(1, '../')
-
-from energy_meter import EnergyMeter
+from energymeter import EnergyMeter
 import time
 import numpy as np
 from urllib.request import urlopen
@@ -21,7 +18,7 @@ transforms = torchvision.transforms.Compose([
 
 # the json file where the output must be stored
 
-json_file = open("../imagenet-simple-labels.json", "r")
+json_file = open("imagenet-simple-labels.json", "r")
 imagenet_dict = json.load(json_file)
 json_file.close()
 
