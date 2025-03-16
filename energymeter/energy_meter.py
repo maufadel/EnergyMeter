@@ -266,14 +266,23 @@ class EnergyMeter:
         :returns: the total joules used by the CPU between meter.begin() and meter.end().
         """
         # pyRAPL returns the microjoules, so we convert them to joules.
-        return np.array(self.meter.result.pkg) * 1e-6
+        if self.meter.result.pkg:
+            return np.array(self.meter.result.pkg) * 1e-6
+        else:
+            print("RAPL did not record energy for pkg!")
+            return np.array([0])
 
     def get_total_joules_dram(self):
         """We obtain the total joules consumed by the DRAM from pyRAPL.
         :returns: the total joules used by the DRAM between meter.begin() and meter.end().
         """
         # pyRAPL returns the microjoules, so we convert them to joules.
-        return np.array(self.meter.result.dram) * 1e-6
+        if self.meter.result.dram:
+            return np.array(self.meter.result.dram) * 1e-6
+        else:
+            print("RAPL did not record energy for dram!")
+            return np.array([0])
+            
 
     def get_total_joules_gpu(self):
         """We calculate the GPU's energy consumption while the meter was running. For this,
