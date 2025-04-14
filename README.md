@@ -1,6 +1,14 @@
 # EnergyMeter
 EnergyMeter is a Python module that combines pyRAPL, NVIDIA-SMI and eBPF to estimate the energy consumption of CPU, memory, GPU, and storage on Linux with only three lines of code. This was developed during the development of the article Fadel Argerich, M., & Patiño-Martínez, M. (2024). Measuring and Improving the Energy Efficiency of Large Language Models Inference. IEEE Access.
 
+## How to install
+You can install EnergyMeter by cloning this repository and using pip:
+```
+git clone https://github.com/maufadel/EnergyMeter.git
+cd EnergyMeter
+pip install .
+```
+
 ## How to use
 The most basic usage of EnergyMeter is as follows:
 ```
