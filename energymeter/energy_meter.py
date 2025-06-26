@@ -86,9 +86,15 @@ class ThreadGpuSamplingPyNvml(threading.Thread):
         while self.stop == False:
             nvml_output = self.nvsmi.DeviceQuery("power.draw,utilization.gpu").get("gpu")[0]
             # Get power draw.
-            self.power_draw_history.append(nvml_output.get("power_readings").get("power_draw"))
+            try:
+                self.power_draw_history.append(float(nvml_output.get("power_readings").get("power_draw")))
+            except:
+                pass
             # Get utilization at each time step.
-            self.activity_history.append(nvml_output.get("utilization").get("gpu_util"))
+            try:
+                self.activity_history.append(float(nvml_output.get("utilization").get("gpu_util")))
+            except:
+                pass
 
 
 class EnergyMeter:
@@ -155,7 +161,14 @@ class EnergyMeter:
         self.include_idle = include_idle
 
         # Setup pyRAPL to measure CPU and DRAM.
-        pyRAPL.setup()
+        try:
+            pyRAPL.setup()
+
+            # Create the pyRAPL meter to measure CPU and DRAM energy consumption.
+            self.meter = pyRAPL.Measurement(self.label)
+        except:
+            print("RAPL is not accessible, no CPU or memory energy metrics are available!")
+            self.meter = None
 
         # Setup disk parameters.
         self.disk_avg_speed = disk_avg_speed
@@ -164,9 +177,6 @@ class EnergyMeter:
 
         # Create thread for sampling the power draw of the GPU, this sets up pynvm.
         self.thread_gpu = ThreadGpuSamplingPyNvml("GPU Sampling Thread")
-
-        # Create the pyRAPL meter to measure CPU and DRAM energy consumption.
-        self.meter = pyRAPL.Measurement(self.label)
 
         # Create command for bpftrace subprocess that will count the bytes read and
         # written to disk.
@@ -179,8 +189,11 @@ class EnergyMeter:
         reads the current RAPL counters. You should have start the bash script
         start_meters.sh BEFORE calling this function.
         """
+        self.start_time = time.time()
+        
         # pyRAPL for CPU and DRAM.
-        self.meter.begin()
+        if self.meter:
+            self.meter.begin()
 
         # bpftrace for disk.
         self.popen = subprocess.Popen(
@@ -199,7 +212,8 @@ class EnergyMeter:
         start_meters.sh AFTER calling this method.
         """
         # PyRAPL.
-        self.meter.end()
+        if self.meter:
+            self.meter.end()
 
         # Kill bpftrace subprocess.
         subprocess.check_output(shlex.split("sudo kill {}".format(self.bpftrace_pid)))
@@ -210,6 +224,9 @@ class EnergyMeter:
         # Process bpftrace output.
         po = self.popen.stdout.read()
         self.total_rbytes, self.total_wbytes = self.__preprocess_bpftrace_output(po)
+
+        self.end_time = time.time()
+        self.duration = self.end_time - self.start_time
 
     def __preprocess_bpftrace_output(self, bpftrace_output):
         """Preprocess the output of out bpftrace script and extract the bytes read and
@@ -253,7 +270,7 @@ class EnergyMeter:
         disk_active_time = tot_bytes / self.disk_avg_speed
 
         # disk_idle_time (in seconds) = total_meter_time - disk_active_time
-        disk_idle_time = self.meter.result.duration * 1e-6 - disk_active_time
+        disk_idle_time = self.duration - disk_active_time
 
         # total_energy = disk_active_time * DISK_ACTIVE_POWER (+ disk_idle_time * DISK_IDLE_POWER)
         te = disk_active_time * self.disk_active_power
@@ -266,7 +283,7 @@ class EnergyMeter:
         :returns: the total joules used by the CPU between meter.begin() and meter.end().
         """
         # pyRAPL returns the microjoules, so we convert them to joules.
-        if self.meter.result.pkg:
+        if self.meter and self.meter.result.pkg:
             return np.array(self.meter.result.pkg) * 1e-6
         else:
             print("RAPL did not record energy for pkg!")
@@ -277,7 +294,7 @@ class EnergyMeter:
         :returns: the total joules used by the DRAM between meter.begin() and meter.end().
         """
         # pyRAPL returns the microjoules, so we convert them to joules.
-        if self.meter.result.dram:
+        if self.meter and self.meter.result.dram:
             return np.array(self.meter.result.dram) * 1e-6
         else:
             print("RAPL did not record energy for dram!")
@@ -300,7 +317,7 @@ class EnergyMeter:
         if self.include_idle:
             # We use the mean power draw thoughout the whole time (including idle time.)
             mean_p = np.mean(self.thread_gpu.power_draw_history)
-            te = mean_p * self.meter.result.duration * 1e-6
+            te = mean_p * self.duration
         else:
             # First, check if there was any activity, otherwise return 0.
             if sum(self.thread_gpu.activity_history) == 0:
@@ -317,7 +334,7 @@ class EnergyMeter:
             # We estimate the task was running for length of samples * the time between samples,
             # or the duration of the meter if this was shorter. Our error in this estimation is
             # bounded to (t - 2*SECONDS_BETWEEN_SAMPLES, t + SECONDS_BETWEEN_SAMPLES).
-            te = mean_p * min(self.meter.result.duration * 1e-6, len(ah)*sbs)
+            te = mean_p * min(self.duration, len(ah)*sbs)
             
         return te
 
@@ -360,6 +377,6 @@ class EnergyMeter:
         ax.bar_label(bars)
         plt.xlabel("Components")
         plt.ylabel("joules")
-        plt.title(self.meter.label)
+        plt.title(self.name)
 
         plt.show()
