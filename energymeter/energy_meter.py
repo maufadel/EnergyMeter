@@ -137,8 +137,8 @@ class EnergyMeter:
     )
     ###################################################################################
 
-    def __init__(self, disk_avg_speed, disk_active_power, disk_idle_power, 
-                 label=None, include_idle=False):
+    def __init__(self, disk_avg_speed=None, disk_active_power=None, disk_idle_power=None, 
+                 label=None, include_idle=False, ignore_disk=False):
         """Initiates the variables required to meter the energy consumption of all
         components and sets up the pyRAPL library.
         :param disk_avg_speed: the average read and write speed of the hard disk where
@@ -150,8 +150,10 @@ class EnergyMeter:
         :param disk_idle_power: the average power used by the disk when idle. Just as for
             disk_active_power, this is usually included in the disk specs.
         :param label: this is just an optional string to identify the meter.
-        :include_idle: if energy used during idle times should be included for disk and 
+        :param include_idle: if energy used during idle times should be included for disk and 
             GPU.
+        :param ignore_disk: False by default, when set to True, disk will not be tracked (used
+            for compatibility with systems without access to sudo or bpftrace)
         """
         if label:
             self.label = label
@@ -167,13 +169,16 @@ class EnergyMeter:
             # Create the pyRAPL meter to measure CPU and DRAM energy consumption.
             self.meter = pyRAPL.Measurement(self.label)
         except:
-            print("RAPL is not accessible, no CPU or memory energy metrics are available!")
             self.meter = None
 
         # Setup disk parameters.
-        self.disk_avg_speed = disk_avg_speed
-        self.disk_active_power = disk_active_power
-        self.disk_idle_power = disk_idle_power
+        self.ignore_disk = ignore_disk
+        if ignore_disk == False and (disk_avg_speed is None or disk_active_power is None or disk_idle_power is None):
+            raise Exception("disk_avg_speed, disk_active_power, and disk_idle_power are necessary values if disk energy will be monitored; if you want to ignore the disk, set ignore_disk=True when calling init.")
+        else:
+            self.disk_avg_speed = disk_avg_speed
+            self.disk_active_power = disk_active_power
+            self.disk_idle_power = disk_idle_power
 
         # Create thread for sampling the power draw of the GPU, this sets up pynvm.
         self.thread_gpu = ThreadGpuSamplingPyNvml("GPU Sampling Thread")
@@ -194,13 +199,15 @@ class EnergyMeter:
         # pyRAPL for CPU and DRAM.
         if self.meter:
             self.meter.begin()
+        else:
+            print("RAPL is not accessible, no CPU or memory energy metrics are available!")
 
         # bpftrace for disk.
-        self.popen = subprocess.Popen(
-            self.bpftrace_command, stdout=subprocess.PIPE, preexec_fn=os.setpgrp
-        )
-        # We save the bpftrace pid to kill it later.
-        self.bpftrace_pid = os.getpgid(self.popen.pid)
+        if not self.ignore_disk:
+            self.popen = subprocess.Popen(
+                self.bpftrace_command, stdout=subprocess.PIPE, preexec_fn=os.setpgrp
+            )
+            self.bpftrace_pid = os.getpgid(self.popen.pid)
 
         # Thread for GPU.
         self.thread_gpu.start()
@@ -216,14 +223,18 @@ class EnergyMeter:
             self.meter.end()
 
         # Kill bpftrace subprocess.
-        subprocess.check_output(shlex.split("sudo kill {}".format(self.bpftrace_pid)))
+        if not self.ignore_disk:
+            subprocess.check_output(shlex.split("sudo kill {}".format(self.bpftrace_pid)))
 
         # Stop tracking GPU power usage.
         self.thread_gpu.stop = True
 
         # Process bpftrace output.
-        po = self.popen.stdout.read()
-        self.total_rbytes, self.total_wbytes = self.__preprocess_bpftrace_output(po)
+        if not self.ignore_disk:
+            po = self.popen.stdout.read()
+            self.total_rbytes, self.total_wbytes = self.__preprocess_bpftrace_output(po)
+        else:
+            self.total_rbytes, self.total_wbytes = 0, 0
 
         self.end_time = time.time()
         self.duration = self.end_time - self.start_time
@@ -264,6 +275,9 @@ class EnergyMeter:
             output of disk_io.bt was saved.)
         :returns: the total joules used by the disk between meter.begin() and meter.end().
         """
+        if self.ignore_disk:
+            return 0
+            
         tot_bytes = self.total_rbytes + self.total_wbytes
 
         # disk_active_time (in seconds) = (bytes_read + bytes_written) / DISK_SPEED
