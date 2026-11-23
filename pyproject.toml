@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-energymeter"
-version = "2.0.2"
+version = "2.1.0"
 description = "A library to measure energy consumption of applications"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -15,18 +15,29 @@ authors = [
 ]
 
 dependencies = [
-  "pynvml",
-  "pyRAPL",
   "numpy",
-  "pandas",
-  "matplotlib"
+  "matplotlib",
+  # NVML bindings: install the official package. The standalone `pynvml`
+  # distribution is deprecated and just re-exports nvidia-ml-py.
+  # Pure-Python and only meaningful with an NVIDIA GPU, so scoped to Linux.
+  "nvidia-ml-py; sys_platform == 'linux'",
 ]
 
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
 ]
+
+[project.scripts]
+# `energymeter start` / `energymeter stop` from a terminal.
+energymeter = "energymeter.cli:main"
+
+[project.optional-dependencies]
+# pandas is not used by the core EnergyMeter. Kept here for any analysis helpers.
+# Install with:  pip install ai-energymeter[analysis]
+analysis = ["pandas"]
 
 [project.urls]
 Homepage = "https://github.com/maufadel/EnergyMeter"
