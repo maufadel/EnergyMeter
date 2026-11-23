@@ -180,6 +180,10 @@ def cmd_start(args):
                   f"and see the results.")
             if session.get("metrics_url"):
                 print(f"Prometheus metrics: {session['metrics_url']}")
+            # The meter's own notes (warnings, default disk figures) go to the log; show them.
+            for line in _log_tail(50).splitlines():
+                if line.startswith(("Warning", "Disk ", "RAPL", "CPU and DRAM")):
+                    print("  " + line)
             return 0
         if proc.poll() is not None:
             break
@@ -236,6 +240,8 @@ def cmd_stop(args):
         print(f"  {name:10s} {joules:10.2f} {joules / duration if duration else 0:10.2f}")
     print(f"  {'total':10s} {total:10.2f} {total / duration if duration else 0:10.2f}"
           f"   ({total / 3600:.4f} Wh)")
+    if "disks" in result and not result["disks"] and result["joules"].get("disk", 0) == 0:
+        print("  disk: not tracked (--no-disk was given, or see the warnings `energymeter start` printed)")
     for name, d in (result.get("disks") or {}).items():
         print(f"  disk {name} ({d['type'] or 'given values'}): {d['bytes_read'] / 1e6:.1f} MB "
               f"read, {d['bytes_written'] / 1e6:.1f} MB written, {d['joules']:.2f} J")
