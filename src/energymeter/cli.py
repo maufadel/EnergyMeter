@@ -9,10 +9,10 @@
 
 `start` launches a background process that runs an EnergyMeter until `stop` tells it to finish.
 CPU, DRAM and GPU (and ANE on Apple Silicon) are read from system-wide counters, so they include
-everything running on the machine. On macOS the disk is tracked too: all reads and writes on
-the internal disk, by any app (on Apple Silicon, with default SSD figures unless the --disk-*
-options are given; on Intel Macs, give all three). On Linux, disk tracking is off unless the
-three --disk-* options are given, and then only counts processes named python/python3.
+everything running on the machine. The disk is tracked too: all reads and writes by any app,
+on the internal disk (macOS) or every physical disk (Linux), with no sudo. Disk energy uses
+default figures for each disk's type (Apple SSD, NVMe, SATA SSD, hard drive) unless the
+--disk-* options are given; Intel Macs need all three. --no-disk turns it off.
 
 With --prometheus-port, the background process also serves live metrics for Prometheus at
 http://ADDR:PORT/metrics until `stop`.
@@ -129,6 +129,7 @@ def _daemon(options):
         "total_joules": sum(components.values()),
         "disk_bytes": {"read": int(getattr(meter, "total_rbytes", 0)),
                        "written": int(getattr(meter, "total_wbytes", 0))},
+        "disks": meter.get_disk_details(),
     }
     meter.cleanup()
     _write_json(RESULT_FILE, result)
@@ -145,18 +146,17 @@ def cmd_start(args):
         return 1
 
     disk_values = (args.disk_speed, args.disk_active_power, args.disk_idle_power)
-    apple_silicon = sys.platform == "darwin" and platform.machine() == "arm64"
+    intel_mac = sys.platform == "darwin" and platform.machine() != "arm64"
     disk = None
     if args.no_disk:
         pass
-    elif apple_silicon or all(v is not None for v in disk_values):
-        # Missing values on Apple Silicon are filled with the meter's Apple SSD defaults.
+    elif not intel_mac or all(v is not None for v in disk_values):
+        # The whole disk, by any app. Values not given default to each disk's type.
         disk = {"speed": args.disk_speed, "active_power": args.disk_active_power,
-                "idle_power": args.disk_idle_power,
-                "scope": "system" if sys.platform == "darwin" else "process"}
+                "idle_power": args.disk_idle_power, "scope": "system"}
     elif any(v is not None for v in disk_values):
-        print("To track the disk, give all of --disk-speed, --disk-active-power and "
-              "--disk-idle-power.")
+        print("On Intel Macs, give all of --disk-speed, --disk-active-power and "
+              "--disk-idle-power to track the disk.")
         return 2
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -236,10 +236,9 @@ def cmd_stop(args):
         print(f"  {name:10s} {joules:10.2f} {joules / duration if duration else 0:10.2f}")
     print(f"  {'total':10s} {total:10.2f} {total / duration if duration else 0:10.2f}"
           f"   ({total / 3600:.4f} Wh)")
-    disk_bytes = result.get("disk_bytes")
-    if disk_bytes and (disk_bytes["read"] or disk_bytes["written"]):
-        print(f"  disk I/O: {disk_bytes['read'] / 1e6:.1f} MB read, "
-              f"{disk_bytes['written'] / 1e6:.1f} MB written")
+    for name, d in (result.get("disks") or {}).items():
+        print(f"  disk {name} ({d['type'] or 'given values'}): {d['bytes_read'] / 1e6:.1f} MB "
+              f"read, {d['bytes_written'] / 1e6:.1f} MB written, {d['joules']:.2f} J")
     if args.output:
         print(f"Saved to {args.output}")
     return 0
@@ -258,13 +257,12 @@ def main(argv=None):
                          help="include idle energy for the disk and NVIDIA GPUs")
     p_start.add_argument("--no-disk", action="store_true", help="do not track the disk")
     p_start.add_argument("--disk-speed", type=float, metavar="BYTES_PER_S",
-                         help="average disk read/write speed (on Apple Silicon defaults to "
-                              "3e9; elsewhere, giving all three --disk-* enables disk tracking)")
+                         help="average disk read/write speed (default: by disk type)")
     p_start.add_argument("--disk-active-power", type=float, metavar="WATTS",
-                         help="disk power while reading/writing (Apple Silicon default: 3)")
+                         help="disk power while reading/writing (default: by disk type)")
     p_start.add_argument("--disk-idle-power", type=float, metavar="WATTS",
-                         help="disk power while idle, used with --include-idle (Apple Silicon "
-                              "default: 0.05)")
+                         help="disk power while idle, used with --include-idle (default: by "
+                              "disk type)")
     p_start.add_argument("--prometheus-port", type=int, metavar="PORT",
                          help="serve live metrics for Prometheus on this port until `stop`")
     p_start.add_argument("--prometheus-addr", default="127.0.0.1", metavar="ADDR",

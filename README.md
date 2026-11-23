@@ -1,8 +1,14 @@
 # EnergyMeter
 EnergyMeter is a Python module that combines RAPL, NVIDIA-SMI and eBPF to estimate the energy consumption of CPU, memory, GPU, and storage on Linux with only three lines of code. This was developed during the development of the article Fadel Argerich, M., & Patiño-Martínez, M. (2024). Measuring and Improving the Energy Efficiency of Large Language Models Inference. IEEE Access.
 
-### Update: version 2.0 is out! 
-The new version improves the accuracy of the energy consumption of the GPU while also reducing the overhead of the meter, so there is no visible overhead now.
+### Update: version 3.0 is out!
+- **macOS on Apple Silicon:** CPU, GPU and Neural Engine energy via `powermetrics`, DRAM via the kernel's energy counters, and disk via the kernel's I/O counters.
+- **Terminal command:** `energymeter start` / `status` / `stop` measures the whole machine while you do anything else.
+- **Prometheus:** live metrics at `/metrics`, from Python or the terminal.
+- **Disk:** default figures for each disk type (Apple SSD, NVMe, SATA SSD, hard drive), so disk values are now optional, and whole-disk tracking without sudo (`disk_scope="system"`).
+- **Linux:** RAPL is read directly and sampled every second, so counter wraparounds no longer corrupt long measurements (pyRAPL is no longer a dependency).
+
+Version 2.0 improved the accuracy of GPU energy while reducing the meter's overhead.
 
 ## How to install
 You can install EnergyMeter via pip or uv and PyPi: `pip install ai-energymeter`, or by cloning this repository and using pip:
@@ -17,11 +23,13 @@ The most basic usage of EnergyMeter is as follows:
 ```
 from energymeter import EnergyMeter
 
-em = EnergyMeter(disk_avg_speed=1600*1e6, # The average speed of your storage (see below how you can get it)
-                  disk_active_power=6,    # How many Watts are used when the storage is reading or writing (you can usually find it in specs of your storage)
-                  disk_idle_power=1.42,   # How many Watts are used when the storage is idle (you can usually find it in specs of your storage)
-                  label="Test Meter",     # A label to identify the measurement
+em = EnergyMeter(label="Test Meter",     # A label to identify the measurement
                   include_idle=False)     # If energy used during idle should be accounted for in the measurement. Defaults to False.
+# Disk energy is estimated from the bytes read and written. By default EnergyMeter uses typical
+# figures for your disk's type (see "Disk" below). For better estimates, give your own:
+#   EnergyMeter(disk_avg_speed=1600*1e6,  # average speed of your storage in bytes/s (see below how to get it)
+#               disk_active_power=6,      # Watts while reading or writing (usually in your storage's specs)
+#               disk_idle_power=1.42)     # Watts while idle (usually in your storage's specs)
     
 em.begin()
 # --> CODE YOU WANT TO MEASURE <--
@@ -45,9 +53,20 @@ energymeter stop            # prints energy per component; add --json or --outpu
 ```
 CPU, DRAM and GPU (and the Neural Engine on Apple Silicon) are read from system-wide counters, so they include everything running on the machine.
 
-**Disk.** On macOS the CLI also tracks the disk: every byte read or written on the internal disk, by any app (downloads, copies, ...), from the same kernel counters `iostat` uses (no sudo). `stop` shows how many MB were read and written. Disk energy is estimated from those bytes and the disk's speed and power. Apple publishes no power figures for its SSDs, so on Apple Silicon EnergyMeter uses rough defaults (3 GB/s, 3 W active, 0.05 W idle, about 1 J per GB); override any of them with `--disk-speed`, `--disk-active-power` and `--disk-idle-power`, or turn the disk off with `--no-disk`. Intel Macs need all three options. On Linux, disk tracking is off unless you pass all three, and it then only counts I/O of `python` processes.
+**Disk.** The CLI also tracks the disk: every byte read or written by any app (downloads, copies, ...), with no sudo. On macOS it counts the internal disk (the counters `iostat` uses); on Linux, every physical disk from `/proc/diskstats` (partitions, LVM/LUKS, RAID and loop devices are skipped, since their I/O lands on the disks underneath). `stop` shows how many MB each disk read and wrote, and its energy.
 
-From Python, the default stays per-process (the code you measure). To count the whole internal disk on macOS, use `EnergyMeter(disk_scope="system")`; on Apple Silicon any disk figures you leave out default to `energymeter.APPLE_SSD_DEFAULTS`.
+Disk energy is estimated from those bytes and each disk's speed and power. Unless you give them, EnergyMeter uses rough figures for the disk's type, which it detects on its own:
+
+| Disk type | Speed | Active power | Idle power |
+|---|---|---|---|
+| Apple SSD (Apple Silicon) | 3 GB/s | 3 W | 0.05 W |
+| NVMe SSD | 2 GB/s | 5 W | 0.5 W |
+| SATA SSD | 0.5 GB/s | 3 W | 0.3 W |
+| Hard drive | 0.15 GB/s | 6.5 W | 4.5 W |
+
+Override any of them with `--disk-speed`, `--disk-active-power` and `--disk-idle-power` (the values then apply to every disk), or turn the disk off with `--no-disk`. Intel Macs need all three options. Idle power only counts with `--include-idle`.
+
+From Python, the disk values also default to the table above (`energymeter.DISK_DEFAULTS`); any you pass replace them. The library counts only the code you measure by default: the kernel's per-process counters on macOS, and bpftrace on Linux, which needs bpftrace with passwordless sudo (without it the disk is skipped with a warning) and uses the type of the disk holding the working directory. To count the whole disk by any app instead, with no sudo, use `EnergyMeter(disk_scope="system")`. `em.get_disk_details()` shows the bytes, figures and energy per disk.
 
 ### Prometheus
 EnergyMeter can serve live metrics for Prometheus while it measures, both from Python and from the terminal:
@@ -102,6 +121,12 @@ Also note that you need to have bpftrace installed. On ubuntu, you can install i
 `sudo apt-get install -y bpftrace`
 
 For other operating systems, please check https://github.com/bpftrace/bpftrace/blob/master/INSTALL.md.
+
+bpftrace runs with `sudo -n`, which never asks for a password, so it needs a passwordless sudo rule. Add one with `sudo visudo -f /etc/sudoers.d/energymeter`, replacing `youruser` and the path (`which bpftrace`) with yours:
+
+`youruser ALL=(root) NOPASSWD: /usr/bin/bpftrace`
+
+Without it, per-process disk tracking is skipped with a warning; `disk_scope="system"` (and the CLI) need no sudo at all.
 
 ## Limitations
 EnergyMeter requires to be run on bare metal instances running Linux on Intel and NVIDIA hardware. These requirements are inherited from the tools used for tracking the energy consumption: RAPL (Intel), NVIDIA-SMI (NVIDIA), and eBPF (Linux). These tools are known to have a high accuracy thanks to their access to low level sensors, but it is important to keep in mind that the energy consumption metrics provided are still estimations and vary according to different factors including hardware configuration and software versions. Additionally, the energy consumed by cooling, screens and other components not mentioned here are not included in our measurements, so the total energy consumed will likely be different to the total sum of the consumption of CPU, memory, GPU, and storage. 

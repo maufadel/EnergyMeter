@@ -7,10 +7,11 @@ Hard Disk).
 Platform support
 ----------------
 - Linux + Intel/AMD: CPU and DRAM are measured with RAPL (read from the powercap sysfs files,
-  sampled periodically so counter wraparounds are handled); disk via bpftrace.
+  sampled periodically so counter wraparounds are handled); disk via bpftrace (per process)
+  or /proc/diskstats (whole system).
 - macOS + Apple Silicon: CPU, GPU and ANE power are measured with Apple's `powermetrics` tool
   (requires sudo); DRAM with the kernel's IOReport "DRAM" energy counter (no sudo); disk via the kernel's per-process I/O counters
-  (proc_pid_rusage; no sudo, works with SIP enabled).
+  (proc_pid_rusage) or IOKit's per-disk counters (whole system); no sudo, works with SIP.
 - NVIDIA GPUs: measured with PyNVML. Multiple GPUs are supported and ALL detected GPUs are
   tracked by default. If there are no NVIDIA GPUs (or pynvml is absent), GPU tracking is simply
   skipped and reports 0 - it never raises.
@@ -101,6 +102,16 @@ def _darwin_disk_io_bytes(pid=None):
 # ~3 GB/s sustained, ~3 W while transferring, ~0.05 W idle in its low-power state. That is
 # about 1 J per GB moved. Pass your own values to EnergyMeter for better estimates.
 APPLE_SSD_DEFAULTS = {"disk_avg_speed": 3e9, "disk_active_power": 3.0, "disk_idle_power": 0.05}
+
+# Rough figures per disk type, used for any of the three disk values that are not given when
+# the whole disk is tracked (disk_scope="system"). Typical spec-sheet values; real drives vary,
+# so pass your own (see "How to get storage details" in the README) for better estimates.
+DISK_DEFAULTS = {
+    "apple_ssd": APPLE_SSD_DEFAULTS,
+    "nvme": {"disk_avg_speed": 2e9, "disk_active_power": 5.0, "disk_idle_power": 0.5},
+    "ssd": {"disk_avg_speed": 5e8, "disk_active_power": 3.0, "disk_idle_power": 0.3},
+    "hdd": {"disk_avg_speed": 1.5e8, "disk_active_power": 6.5, "disk_idle_power": 4.5},
+}
 
 
 class _DarwinSystemDiskCounters:
@@ -196,10 +207,86 @@ class _DarwinSystemDiskCounters:
             self._iokit.IOObjectRelease(it.value)
         return read, written, disks
 
+    @property
+    def kinds(self):
+        return {"internal": "apple_ssd" if _is_apple_silicon() else None}
+
     def __call__(self):
-        """(bytes_read, bytes_written) by the internal disks since boot."""
+        """{"internal": (bytes_read, bytes_written)} by the internal disks since boot."""
         read, written, _ = self._read()
-        return read, written
+        return {"internal": (read, written)}
+
+
+def _linux_disk_kind_for_path(path=".", sys_block="/sys/block", sys_dev="/sys/dev/block"):
+    """Type ("nvme", "ssd" or "hdd") of the physical disk that holds `path`, following
+    partitions and LVM/LUKS/RAID layers down to a disk. None if it cannot be told."""
+    try:
+        kinds = _LinuxSystemDiskCounters.disk_kinds(sys_block)
+        dev = os.stat(path).st_dev
+        node = os.path.realpath(f"{sys_dev}/{os.major(dev)}:{os.minor(dev)}")
+    except (OSError, ValueError):
+        return None
+    for _ in range(8):  # a few layers at most (partition -> dm -> md -> disk)
+        name = os.path.basename(node)
+        if name in kinds:
+            return kinds[name]
+        parent = os.path.basename(os.path.dirname(node))
+        if parent in kinds:  # a partition: .../block/sda/sda1
+            return kinds[parent]
+        try:
+            slaves = sorted(os.listdir(os.path.join(node, "slaves")))
+        except OSError:
+            slaves = []
+        if not slaves:
+            break
+        node = os.path.realpath(os.path.join(node, "slaves", slaves[0]))
+    kinds_found = set(kinds.values())
+    return kinds_found.pop() if len(kinds_found) == 1 else None
+
+
+class _LinuxSystemDiskCounters:
+    """System-wide bytes read/written per physical disk (all processes), from /proc/diskstats.
+    No sudo needed. Only whole physical disks are counted: partitions, loop devices, device
+    mapper (LVM, LUKS), software RAID and RAM disks are skipped, since their I/O is already
+    counted on the disks underneath. Each disk's type (nvme, ssd or hdd) is read from sysfs."""
+
+    _VIRTUAL = ("loop", "ram", "zram", "dm-", "md", "sr", "nbd", "fd")
+    _SECTOR = 512  # /proc/diskstats always counts 512-byte sectors
+
+    def __init__(self, diskstats="/proc/diskstats", sys_block="/sys/block"):
+        self.diskstats = diskstats
+        self.kinds = self.disk_kinds(sys_block)
+        if not self.kinds:
+            raise OSError(f"no physical disks found in {sys_block}")
+        self()  # fails here, not mid-measurement, if /proc/diskstats is unreadable
+
+    @classmethod
+    def disk_kinds(cls, sys_block="/sys/block"):
+        """{disk: "nvme" | "ssd" | "hdd"} for each physical disk."""
+        kinds = {}
+        for name in sorted(os.listdir(sys_block)):
+            path = os.path.join(sys_block, name)
+            if name.startswith(cls._VIRTUAL) or not os.path.exists(os.path.join(path, "device")):
+                continue
+            try:
+                with open(os.path.join(path, "queue", "rotational")) as f:
+                    rotational = f.read().strip() == "1"
+            except OSError:
+                rotational = False
+            kinds[name] = "nvme" if name.startswith("nvme") else (
+                "hdd" if rotational else "ssd")
+        return kinds
+
+    def __call__(self):
+        """{disk: (bytes_read, bytes_written)} since boot."""
+        result = {}
+        with open(self.diskstats) as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 10 and fields[2] in self.kinds:
+                    result[fields[2]] = (int(fields[5]) * self._SECTOR,
+                                         int(fields[9]) * self._SECTOR)
+        return result
 
 
 class _IOReportEnergyCounter:
@@ -872,14 +959,16 @@ class EnergyMeter:
     - GPU: NVIDIA GPUs via PyNVML (all detected GPUs by default, multi-GPU aware); on Apple
         Silicon the integrated GPU via `powermetrics`. ANE (Neural Engine) and package power
         are also captured on Apple Silicon.
-    - Disk: tracked by counting bytes read/written - via bpftrace on Linux (requested bytes of
-        read()/write() syscalls), and on macOS via this process's kernel I/O counters
-        (proc_pid_rusage: bytes that actually hit storage) - then converting to energy with
-        the disk speed/power model:
+    - Disk: tracked by counting bytes read/written, then converting them to energy per disk
+        with the speed/power model:
             disk_active_time = (bytes_read + bytes_written) / DISK_SPEED
             disk_idle_time   = total_meter_time - disk_active_time
             total_energy     = disk_active_time * DISK_ACTIVE_POWER (+ idle term if enabled)
-        You must provide DISK_SPEED, DISK_ACTIVE_POWER and DISK_IDLE_POWER.
+        With disk_scope="process" (default), bytes are those of the measured code (bpftrace on
+        Linux, which needs passwordless sudo; proc_pid_rusage on macOS). With
+        disk_scope="system", bytes are those of every app on the physical disks (/proc/diskstats
+        on Linux, IOKit on macOS; no sudo). Any of DISK_SPEED, DISK_ACTIVE_POWER and
+        DISK_IDLE_POWER not given defaults to the disk's type (DISK_DEFAULTS).
     """
 
     #################################### CONSTANTS ####################################
@@ -896,15 +985,18 @@ class EnergyMeter:
                  cpu_sampling_rate=0.1, powermetrics_extra_args=None, rapl_sampling_rate=1.0,
                  prometheus_port=None, prometheus_addr="127.0.0.1", disk_scope="process"):
         """
-        :param disk_avg_speed: average read+write speed of the disk (bytes/s).
+        :param disk_avg_speed: average read+write speed of the disk (bytes/s). Default: by
+            disk type (see DISK_DEFAULTS); the same for the two powers below.
         :param disk_active_power: disk power when active (W).
         :param disk_idle_power: disk power when idle (W).
         :param label: optional string to identify the meter.
         :param include_idle: include idle-time energy for disk and GPU.
         :param ignore_disk: if True, disk is not tracked (on Linux: no bpftrace / no sudo needed).
         :param disk_scope: "process" (default) counts disk I/O of the measured code: this
-            process on macOS, python processes on Linux. "system" (macOS only) counts all
-            I/O on the internal disk, by any app; see APPLE_SSD_DEFAULTS for disk figures.
+            process on macOS, python processes on Linux (bpftrace, needs passwordless sudo;
+            the disk type is that of the disk holding the working directory). "system" counts
+            all I/O by any app: the internal disk on macOS (IOKit), every physical disk on
+            Linux (/proc/diskstats); no sudo.
         :param gpu_index: (backwards-compatible) a SINGLE NVIDIA GPU index to monitor.
         :param gpu_indices: iterable of NVIDIA GPU indices. If both this and gpu_index are None
             (the default), ALL detected NVIDIA GPUs are tracked.
@@ -961,46 +1053,70 @@ class EnergyMeter:
                       ">= 5.10 reading them needs root; see the README).")
 
         # --- Disk setup ---------------------------------------------------------------------
-        self.ignore_disk = ignore_disk
-        if disk_scope == "system" and self.is_apple_silicon:
-            # The internal SSD's figures are not published; fill any missing ones with ours.
-            disk_avg_speed = disk_avg_speed or APPLE_SSD_DEFAULTS["disk_avg_speed"]
-            disk_active_power = disk_active_power or APPLE_SSD_DEFAULTS["disk_active_power"]
-            if disk_idle_power is None:
-                disk_idle_power = APPLE_SSD_DEFAULTS["disk_idle_power"]
-        if ignore_disk == False and (disk_avg_speed is None or disk_active_power is None or disk_idle_power is None):
-            raise Exception("disk_avg_speed, disk_active_power, and disk_idle_power are necessary values if disk energy will be monitored; if you want to ignore the disk, set ignore_disk=True when calling init.")
-        else:
-            self.disk_avg_speed = disk_avg_speed
-            self.disk_active_power = disk_active_power
-            self.disk_idle_power = disk_idle_power
-
-        # Choose the disk-tracing backend for this platform.
-        if self.ignore_disk:
-            self.disk_backend = "none"
-        elif self.is_darwin:
-            self.disk_backend = "iokit" if disk_scope == "system" else "rusage"
-        elif disk_scope == "system":
-            raise ValueError('disk_scope="system" is only supported on macOS')
-        else:
-            self.disk_backend = "bpftrace"
-
         if disk_scope not in ("process", "system"):
             raise ValueError('disk_scope must be "process" or "system"')
-        self._disk_counter = None  # () -> (bytes_read, bytes_written), for counter backends
+        self.ignore_disk = ignore_disk
+        self.disk_scope = disk_scope
+        self.disk_avg_speed = disk_avg_speed
+        self.disk_active_power = disk_active_power
+        self.disk_idle_power = disk_idle_power
+        self._disk_counter = None  # () -> {disk: (bytes_read, bytes_written)}
+        self.disk_kinds = {}       # {disk: "apple_ssd" | "nvme" | "ssd" | "hdd" | None}
+        self.disk_bytes = {}       # {disk: (bytes_read, bytes_written)} measured, after end()
+
+        if self.ignore_disk:
+            self.disk_backend = "none"
+        elif disk_scope == "system":
+            self.disk_backend = "iokit" if self.is_darwin else "diskstats"
+        else:
+            self.disk_backend = "rusage" if self.is_darwin else "bpftrace"
+
         if self.disk_backend == "rusage":
-            self._disk_counter = _darwin_disk_io_bytes
-        elif self.disk_backend == "iokit":
+            self._disk_counter = lambda: {"process": _darwin_disk_io_bytes()}
+            self.disk_kinds = {"process": "apple_ssd" if self.is_apple_silicon else None}
+        elif self.disk_backend == "bpftrace":
+            # bpftrace needs root. `sudo -n` never prompts: without passwordless sudo it fails
+            # at once (here, not mid-measurement) instead of waiting for a password.
             try:
-                self._disk_counter = _DarwinSystemDiskCounters()
+                ok = subprocess.run(["sudo", "-n", "bpftrace", "--version"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=10).returncode == 0
+            except Exception:
+                ok = False
+            if ok:
+                # Assume the measured code's I/O goes to the disk holding the working directory.
+                self.disk_kinds = {"python": _linux_disk_kind_for_path(os.getcwd())}
+            else:
+                print("Warning: disk tracking per process needs bpftrace with passwordless sudo, "
+                      "so the disk will not be tracked. Use disk_scope=\"system\" to track the "
+                      "whole disk without sudo, or ignore_disk=True to hide this warning.")
+                self.ignore_disk = True
+                self.disk_backend = "none"
+        elif self.disk_backend in ("iokit", "diskstats"):
+            try:
+                counter = (_DarwinSystemDiskCounters() if self.disk_backend == "iokit"
+                           else _LinuxSystemDiskCounters())
+                self._disk_counter, self.disk_kinds = counter, dict(counter.kinds)
             except Exception as e:
-                print(f"Warning: disk energy will not be available (IOKit: {e}).")
+                print(f"Warning: disk energy will not be available ({e}).")
                 self.ignore_disk = True
                 self.disk_backend = "none"
 
+        # Every disk needs a speed and two powers: the ones given, else its type's defaults.
+        if self.disk_backend != "none" and None in (disk_avg_speed, disk_active_power,
+                                                    disk_idle_power):
+            if any(kind not in DISK_DEFAULTS for kind in self.disk_kinds.values()):
+                raise Exception("Could not tell this disk's type, so disk_avg_speed, disk_active_power and disk_idle_power are needed to monitor the disk; to ignore the disk, set ignore_disk=True.")
+            for disk, kind in self.disk_kinds.items():
+                speed, active, idle = self._disk_figures(disk)
+                print(f"Disk {disk}: using {'given values and ' if any(v is not None for v in (disk_avg_speed, disk_active_power, disk_idle_power)) else ''}"
+                      f"defaults for {kind} ({speed / 1e9:g} GB/s, {active:g} W active, "
+                      f"{idle:g} W idle); pass disk_avg_speed, disk_active_power and "
+                      f"disk_idle_power for your own.")
+
         if self.disk_backend == "bpftrace":
             self.disk_command = shlex.split(
-                "sudo bpftrace -f json -e '{}'".format(EnergyMeter.SCRIPT)
+                "sudo -n bpftrace -f json -e '{}'".format(EnergyMeter.SCRIPT)
             )
         else:
             self.disk_command = None
@@ -1112,10 +1228,15 @@ class EnergyMeter:
 
         # Stop disk tracer (bpftrace flushes its maps on SIGTERM, the default kill).
         if self.disk_backend == "bpftrace":
+            # Signal the `sudo` process itself (it runs as us, so no password is needed); sudo
+            # relays SIGTERM to bpftrace, which then prints its byte counts and exits.
             try:
-                subprocess.check_output(
-                    shlex.split("sudo kill {}".format(self.disk_pgid))
-                )
+                self.popen.terminate()
+                try:
+                    self.popen.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(["sudo", "-n", "kill", str(self.popen.pid)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(f"Warning: Could not stop {self.disk_backend}: {e}")
 
@@ -1124,22 +1245,19 @@ class EnergyMeter:
         self.thread_gpu.join(timeout=2.0)
 
         # Collect disk byte counts.
-        if self._disk_counter is not None:
-            if self._disk_io_end is not None:
-                r1, w1 = self._disk_io_end
-                r0, w0 = self._disk_io_start
-                self.total_rbytes, self.total_wbytes = r1 - r0, w1 - w0
-            else:
-                self.total_rbytes, self.total_wbytes = 0, 0
+        if self._disk_counter is not None and self._disk_io_end is not None:
+            self.disk_bytes = self._disk_delta(self._disk_io_start, self._disk_io_end)
         elif self.disk_backend == "bpftrace":
             try:
                 po = self.popen.stdout.read()
-                self.total_rbytes, self.total_wbytes = self.__preprocess_bpftrace_output(po)
+                self.disk_bytes = {"python": self.__preprocess_bpftrace_output(po)}
             except Exception as e:
                 print(f"Warning: Could not read disk-tracer output: {e}")
-                self.total_rbytes, self.total_wbytes = 0, 0
+                self.disk_bytes = {}
         else:
-            self.total_rbytes, self.total_wbytes = 0, 0
+            self.disk_bytes = {}
+        self.total_rbytes = sum(r for r, _ in self.disk_bytes.values())
+        self.total_wbytes = sum(w for _, w in self.disk_bytes.values())
 
         # On Apple Silicon, end() itself waits for powermetrics; that wait is not part of the
         # measured work, so the window ends when end() was called.
@@ -1167,15 +1285,46 @@ class EnergyMeter:
         Kansal et al., "Virtual machine power metering and provisioning", ACM SoCC 2010."""
         if self.ignore_disk or self.disk_backend == "none":
             return 0
+        return self._disk_joules(self.disk_bytes, self.duration)
 
-        tot_bytes = self.total_rbytes + self.total_wbytes
-        disk_active_time = tot_bytes / self.disk_avg_speed
-        disk_idle_time = self.duration - disk_active_time
+    def get_disk_details(self):
+        """{disk: {"type", "bytes_read", "bytes_written", "speed", "active_power",
+        "idle_power", "joules"}} for each tracked disk, after end()."""
+        details = {}
+        for disk, (r, w) in self.disk_bytes.items():
+            speed, active, idle = self._disk_figures(disk)
+            details[disk] = {
+                "type": self.disk_kinds.get(disk), "bytes_read": r, "bytes_written": w,
+                "speed": speed, "active_power": active, "idle_power": idle,
+                "joules": self._disk_joules({disk: (r, w)}, self.duration),
+            }
+        return details
 
-        te = disk_active_time * self.disk_active_power
-        if self.include_idle:
-            te += disk_idle_time * self.disk_idle_power
-        return te
+    @staticmethod
+    def _disk_delta(before, after):
+        """Bytes moved per disk between two counter readings (disks present in both)."""
+        return {d: (max(0, after[d][0] - before[d][0]), max(0, after[d][1] - before[d][1]))
+                for d in after if d in before}
+
+    def _disk_figures(self, disk):
+        """(speed B/s, active W, idle W) for `disk`: the values given, else its type's."""
+        defaults = DISK_DEFAULTS.get(self.disk_kinds.get(disk), {})
+        return tuple(given if given is not None else defaults[name] for name, given in (
+            ("disk_avg_speed", self.disk_avg_speed),
+            ("disk_active_power", self.disk_active_power),
+            ("disk_idle_power", self.disk_idle_power)))
+
+    def _disk_joules(self, disk_bytes, duration):
+        """Speed/power model, per disk: active time = bytes / speed; the rest of the window
+        is idle time (counted only with include_idle)."""
+        total = 0.0
+        for disk, (r, w) in disk_bytes.items():
+            speed, active, idle = self._disk_figures(disk)
+            active_s = (r + w) / speed
+            total += active_s * active
+            if self.include_idle:
+                total += max(0.0, duration - active_s) * idle
+        return total
 
     def get_total_joules_cpu(self):
         """Total CPU energy (J), per socket. RAPL on Linux/Intel/AMD; powermetrics on Apple Silicon."""
@@ -1372,21 +1521,16 @@ class EnergyMeter:
                 pass
 
         # Disk, from the same speed/power model as get_total_joules_disk().
-        rbytes = wbytes = None
+        disk_bytes = None
         if self.end_time is not None:
-            rbytes, wbytes = getattr(self, "total_rbytes", 0), getattr(self, "total_wbytes", 0)
+            disk_bytes = self.disk_bytes
         elif self._disk_counter is not None and hasattr(self, "_disk_io_start"):
             try:
-                r1, w1 = self._disk_counter()
-                r0, w0 = self._disk_io_start
-                rbytes, wbytes = r1 - r0, w1 - w0
+                disk_bytes = self._disk_delta(self._disk_io_start, self._disk_counter())
             except Exception:
                 pass
-        if rbytes is not None and self.disk_backend != "none" and not self.ignore_disk:
-            active_s = (rbytes + wbytes) / self.disk_avg_speed
-            res["disk"] = active_s * self.disk_active_power
-            if self.include_idle:
-                res["disk"] += max(0.0, (now - self.start_time) - active_s) * self.disk_idle_power
+        if disk_bytes and self.disk_backend != "none" and not self.ignore_disk:
+            res["disk"] = self._disk_joules(disk_bytes, now - self.start_time)
         return res
 
     def start_prometheus_exporter(self, port, addr="127.0.0.1"):
