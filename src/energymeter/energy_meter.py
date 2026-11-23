@@ -762,6 +762,10 @@ class ThreadAppleSiliconPowerSampling(threading.Thread):
     POWER_RE = re.compile(r"^\s*([A-Za-z0-9 +\-/()]+?)\s+Power:\s*([0-9]+(?:\.[0-9]+)?)\s*(mW|W)\b")
     # header line carries the true elapsed time for the block
     ELAPSED_RE = re.compile(r"\(([0-9]+(?:\.[0-9]+)?)\s*ms elapsed\)")
+    # GPU activity, from the gpu_power sampler: share of the interval the GPU was busy (like
+    # NVML's utilization) and its average clock while busy.
+    GPU_RESIDENCY_RE = re.compile(r"^\s*GPU HW active residency:\s*([0-9]+(?:\.[0-9]+)?)\s*%")
+    GPU_FREQUENCY_RE = re.compile(r"^\s*GPU HW active frequency:\s*([0-9]+(?:\.[0-9]+)?)\s*MHz")
 
     def __init__(self, name, interval_ms=100, samplers="cpu_power,gpu_power",
                  extra_powermetrics_args=None):
@@ -777,7 +781,8 @@ class ThreadAppleSiliconPowerSampling(threading.Thread):
         self._lock = threading.Lock()
         # Notified every time a new powermetrics block header is read.
         self._new_block = threading.Condition(self._lock)
-        # samples: [ {timestamp, interval_s, powers: {field: watts}}, ... ]
+        # samples: [ {timestamp, interval_s, powers: {field: watts},
+        #             gpu_active_residency_pct, gpu_active_frequency_mhz}, ... ]
         # `timestamp` is when the block was emitted, i.e. the END of the interval it averages,
         # so a block covers [timestamp - interval_s, timestamp].
         self.samples = []
@@ -834,11 +839,25 @@ class ThreadAppleSiliconPowerSampling(threading.Thread):
                         'timestamp': time.time(),
                         'interval_s': float(em.group(1)) / 1000.0,
                         'powers': {},
+                        'gpu_active_residency_pct': None,
+                        'gpu_active_frequency_mhz': None,
                     }
                     with self._new_block:
                         self.samples.append(current)
                         self._new_block.notify_all()
                     continue
+
+                if current is not None and line.lstrip().startswith("GPU HW active"):
+                    gm = self.GPU_RESIDENCY_RE.search(line)
+                    if gm:
+                        with self._lock:
+                            current['gpu_active_residency_pct'] = float(gm.group(1))
+                        continue
+                    gm = self.GPU_FREQUENCY_RE.search(line)
+                    if gm:
+                        with self._lock:
+                            current['gpu_active_frequency_mhz'] = float(gm.group(1))
+                        continue
 
                 pm = self.POWER_RE.search(line)
                 if pm and current is not None:
@@ -877,6 +896,28 @@ class ThreadAppleSiliconPowerSampling(threading.Thread):
         if self.window_end is not None:
             end = min(end, self.window_end)
         return max(0.0, end - start)
+
+    def get_samples_in_window(self, field):
+        """Blocks that overlap the measurement window and report `field`, oldest first:
+        [{timestamp, interval_s, overlap_s, power_w, utilization_pct, frequency_mhz}, ...].
+        `timestamp` is the end of the interval each block averages. utilization_pct and
+        frequency_mhz are the GPU's (None for other fields, or if powermetrics did not say)."""
+        with self._lock:
+            out = []
+            for s in self.samples:
+                overlap = self._overlap_s(s)
+                if field not in s['powers'] or overlap <= 0:
+                    continue
+                gpu = field == "gpu"
+                out.append({
+                    'timestamp': s['timestamp'],
+                    'interval_s': s['interval_s'],
+                    'overlap_s': overlap,
+                    'power_w': s['powers'][field],
+                    'utilization_pct': s.get('gpu_active_residency_pct') if gpu else None,
+                    'frequency_mhz': s.get('gpu_active_frequency_mhz') if gpu else None,
+                })
+            return out
 
     def get_total_joules(self, field):
         """Total energy (joules) for a normalized field key (e.g. 'cpu', 'gpu', 'ane', 'dram',
@@ -1413,6 +1454,37 @@ class EnergyMeter:
         return res
 
     # ---- GPU / Apple introspection --------------------------------------------------------
+    def get_power_samples(self, component="gpu", gpu_index=0):
+        """Power samples taken during the measurement, oldest first, as a list of dicts with the
+        same keys on every platform:
+
+            timestamp        Unix time of the sample (on Apple Silicon: end of the interval
+                             it averages)
+            interval_s       time the sample covers (powermetrics interval; NVIDIA: None)
+            power_w          average power in watts
+            utilization_pct  GPU busy share in % (Apple: "GPU HW active residency"; NVIDIA:
+                             NVML utilization); None for other components
+            frequency_mhz    GPU clock while busy (Apple only); None otherwise
+            temp_c           GPU temperature (NVIDIA only); None otherwise
+
+        component: "gpu" on both platforms; on Apple Silicon also "cpu", "ane", "package" or any
+        other field powermetrics reports. On NVIDIA hosts, gpu_index picks the GPU. Returns []
+        when nothing was sampled (e.g. no supported GPU)."""
+        if self.is_apple_silicon:
+            if self.thread_apple is None:
+                return []
+            return [{
+                'timestamp': s['timestamp'], 'interval_s': s['interval_s'],
+                'power_w': s['power_w'], 'utilization_pct': s['utilization_pct'],
+                'frequency_mhz': s['frequency_mhz'], 'temp_c': None,
+            } for s in self.thread_apple.get_samples_in_window(component)]
+        if component != "gpu":
+            return []
+        return [{
+            'timestamp': s['timestamp'], 'interval_s': None, 'power_w': s['power_w'],
+            'utilization_pct': s['gpu_util'], 'frequency_mhz': None, 'temp_c': s['temp_c'],
+        } for s in self.thread_gpu.get_samples(gpu_index)]
+
     def get_gpu_statistics(self):
         """Aggregate NVIDIA GPU statistics (with a per-GPU breakdown under 'per_gpu')."""
         return self.thread_gpu.get_statistics()
