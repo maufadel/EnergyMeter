@@ -1,5 +1,5 @@
 # EnergyMeter
-EnergyMeter is a Python module that combines RAPL, NVIDIA-SMI and eBPF to estimate the energy consumption of CPU, memory, GPU, and storage on Linux with only three lines of code. This was developed during the development of the article Fadel Argerich, M., & Patiño-Martínez, M. (2024). Measuring and Improving the Energy Efficiency of Large Language Models Inference. IEEE Access.
+EnergyMeter is a Python module that estimates the energy consumption of CPU, memory, GPU, and storage with only three lines of code: on Linux with RAPL, NVIDIA's NVML and eBPF, and on macOS (Apple Silicon) with `powermetrics` and the kernel's energy and I/O counters. This was developed during the development of the article Fadel Argerich, M., & Patiño-Martínez, M. (2024). Measuring and Improving the Energy Efficiency of Large Language Models Inference. IEEE Access.
 
 ### Update: version 3.0 is out!
 - **macOS on Apple Silicon:** CPU, GPU and Neural Engine energy via `powermetrics`, DRAM via the kernel's energy counters, and disk via the kernel's I/O counters.
@@ -39,9 +39,9 @@ em.end()
 meter.plot_total_joules_per_component()
 # or print(em.get_total_joules_per_component())
 ```
-![Example Output](https://github.com/maufadel/meml/blob/main/example_output.png)
+![Example Output](https://raw.githubusercontent.com/maufadel/EnergyMeter/main/example_output.png)
 
-You can check the notebook [Measuring_energy_consumption.ipynb](https://github.com/maufadel/meml/blob/main/Measuring_energy_consumption.ipynb) for more details.
+You can check the notebook [Measuring_energy_consumption.ipynb](https://github.com/maufadel/EnergyMeter/blob/main/Measuring_energy_consumption.ipynb) for more details.
 
 ### From the terminal
 Installing the package also installs an `energymeter` command. It measures the energy used by the whole machine between a `start` and a `stop`, while you do anything else in the meantime:
@@ -129,7 +129,7 @@ bpftrace runs with `sudo -n`, which never asks for a password, so it needs a pas
 Without it, per-process disk tracking is skipped with a warning; `disk_scope="system"` (and the CLI) need no sudo at all.
 
 ## Limitations
-EnergyMeter requires to be run on bare metal instances running Linux on Intel and NVIDIA hardware. These requirements are inherited from the tools used for tracking the energy consumption: RAPL (Intel), NVIDIA-SMI (NVIDIA), and eBPF (Linux). These tools are known to have a high accuracy thanks to their access to low level sensors, but it is important to keep in mind that the energy consumption metrics provided are still estimations and vary according to different factors including hardware configuration and software versions. Additionally, the energy consumed by cooling, screens and other components not mentioned here are not included in our measurements, so the total energy consumed will likely be different to the total sum of the consumption of CPU, memory, GPU, and storage. 
+EnergyMeter must run on bare metal (not in a virtual machine): either Linux on Intel CPUs and NVIDIA GPUs, or macOS on Apple Silicon. These requirements are inherited from the tools used for tracking the energy consumption: RAPL (Intel), NVML (NVIDIA) and eBPF (Linux); `powermetrics` (which needs passwordless sudo) and the kernel's IOReport energy counters (macOS). On macOS, GPU memory and temperature are not available. These tools are known to have a high accuracy thanks to their access to low level sensors, but it is important to keep in mind that the energy consumption metrics provided are still estimations and vary according to different factors including hardware configuration and software versions. Additionally, the energy consumed by cooling, screens and other components not mentioned here are not included in our measurements, so the total energy consumed will likely be different to the total sum of the consumption of CPU, memory, GPU, and storage. 
 
 ## Authorship and License
 I am developing EnergyMeter as a part of my PhD program at Universidad Politécnica de Madrid. EnergyMeter is open sourced under an MIT License. 
